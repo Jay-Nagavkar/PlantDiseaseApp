@@ -1,0 +1,25 @@
+name: crop_app
+description: A new Flutter plant disease detection project.
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # For camera access and image handling
+  camera: ^0.10.5+5
+  image: ^4.1.3
+
+  # For running your TFLite model
+  tflite_flutter: ^0.10.4
+
+flutter:
+  uses-material-design: true
+
+  # Register your ML assets so Flutter can read them
+  assets:
+    - assets/models/plant_disease_model.tflite
+    - assets/models/labels.txt
