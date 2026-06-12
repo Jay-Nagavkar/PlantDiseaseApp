@@ -1,121 +1,237 @@
-import 'package:flutter/material.dart';
 
-void main() {
-  runApp(const MyApp());
+import 'package:flutter/material.dart';
+import 'package:camera/camera.dart';
+import 'package:tflite_flutter/tflite_flutter.dart';
+import 'package:flutter/services.dart';
+import 'dart:io';
+import 'dart:typed_data';
+import 'package:image/image.dart' as img;
+
+late List<CameraDescription> cameras;
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  try {
+    cameras = await availableCameras();
+  } on CameraException catch (e) {
+    print('Error initializing cameras: $e');
+  }
+  runApp(const PlantDiseaseApp());
 }
 
-class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+class PlantDiseaseApp extends StatelessWidget {
+  const PlantDiseaseApp({super.key});
 
-  // This widget is the root of your application.
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Flutter Demo',
+      title: 'Crop Clinic',
       theme: ThemeData(
-        // This is the theme of your application.
-        //
-        // TRY THIS: Try running your application with "flutter run". You'll see
-        // the application has a purple toolbar. Then, without quitting the app,
-        // try changing the seedColor in the colorScheme below to Colors.green
-        // and then invoke "hot reload" (save your changes or press the "hot
-        // reload" button in a Flutter-supported IDE, or press "r" if you used
-        // the command line to start the app).
-        //
-        // Notice that the counter didn't reset back to zero; the application
-        // state is not lost during the reload. To reset the state, use hot
-        // restart instead.
-        //
-        // This works for code too, not just values: Most code changes can be
-        // tested with just a hot reload.
-        colorScheme: .fromSeed(seedColor: Colors.deepPurple),
+        useMaterial3: true,
+        colorScheme: ColorScheme.fromSeed(seedColor: Colors.green),
       ),
-      home: const MyHomePage(title: 'Flutter Demo Home Page'),
+      home: const DiseaseDetectionScreen(),
+      debugShowCheckedModeBanner: false,
     );
   }
 }
 
-class MyHomePage extends StatefulWidget {
-  const MyHomePage({super.key, required this.title});
-
-  // This widget is the home page of your application. It is stateful, meaning
-  // that it has a State object (defined below) that contains fields that affect
-  // how it looks.
-
-  // This class is the configuration for the state. It holds the values (in this
-  // case the title) provided by the parent (in this case the App widget) and
-  // used by the build method of the State. Fields in a Widget subclass are
-  // always marked "final".
-
-  final String title;
+class DiseaseDetectionScreen extends StatefulWidget {
+  const DiseaseDetectionScreen({super.key});
 
   @override
-  State<MyHomePage> createState() => _MyHomePageState();
+  State<DiseaseDetectionScreen> createState() => _DiseaseDetectionScreenState();
 }
 
-class _MyHomePageState extends State<MyHomePage> {
-  int _counter = 0;
+class _DiseaseDetectionScreenState extends State<DiseaseDetectionScreen> {
+  CameraController? _cameraController;
+  Interpreter? _interpreter;
+  List<String>? _labels;
+  bool _isProcessing = false;
+  String _resultText = "Point camera at a leaf and press Scan";
+  String _cureText = "";
 
-  void _incrementCounter() {
+  // Hardcoded Cure/Treatment Database for your placement showcase
+  final Map<String, String> _treatmentDatabase = {
+    "daisy": "Ensure optimal sunlight (6+ hours). Water when top 1 inch of soil is dry. Watch for aphids.",
+    "dandelion": "Typically classified as a weed. If cultivating, ensure well-drained soil. Regular pruning prevents overgrowth.",
+    "roses": "Prune dead stems in early spring. Treat fungal black spots with organic neem oil spray. Water at the base.",
+    "sunflowers": "Requires deep watering during flowering stage. Support tall stems with stakes. Protect leaves from birds.",
+    "tulips": "Keep soil moist but not soggy. Remove spent blooms immediately. Store bulbs in a cool, dry place after foliage dies.",
+  };
+
+  @override
+  void initState() {
+    super.initState();
+    _initializeCamera();
+    _loadModel();
+  }
+
+  Future<void> _initializeCamera() async {
+    if (cameras.isEmpty) return;
+    _cameraController = CameraController(cameras[0], ResolutionPreset.medium, enableAudio: false);
+    await _cameraController!.initialize();
+    if (!mounted) return;
+    setState(() {});
+  }
+
+  Future<void> _loadModel() async {
+    try {
+      _interpreter = await Interpreter.fromAsset('assets/models/plant_disease_model.tflite');
+      final labelString = await rootBundle.loadString('assets/models/labels.txt');
+      _labels = labelString.split('\n').map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
+      print("Model and labels loaded successfully!");
+    } catch (e) {
+      print("Failed to load model or labels: $e");
+    }
+  }
+
+  Future<void> _runInference() async {
+    if (_cameraController == null || !_cameraController!.value.isInitialized || _interpreter == null || _labels == null || _isProcessing) {
+      return;
+    }
+
     setState(() {
-      // This call to setState tells the Flutter framework that something has
-      // changed in this State, which causes it to rerun the build method below
-      // so that the display can reflect the updated values. If we changed
-      // _counter without calling setState(), then the build method would not be
-      // called again, and so nothing would appear to happen.
-      _counter++;
+      _isProcessing = true;
+      _resultText = "Analyzing plant health...";
+      _cureText = "";
     });
+
+    try {
+      // 1. Capture image
+      final XFile file = await _cameraController!.takePicture();
+      final bytes = await File(file.path).readAsBytes();
+      final originalImage = img.decodeImage(bytes);
+      
+      if (originalImage == null) return;
+
+      // 2. Preprocess image to 224x224 (Matches MobileNetV2 input size from Phase 1)
+      final resizedImage = img.copyResize(originalImage, width: 224, height: 224);
+      
+      // 3. Convert image pixels to Float32 array [1, 224, 224, 3]
+      var input = List.generate(1, (_) => List.generate(224, (_) => List.generate(224, (_) => List.filled(3, 0.0))));
+      
+      for (int y = 0; y < 224; y++) {
+        for (int x = 0; x < 224; x++) {
+          final pixel = resizedImage.getPixel(x, y);
+          // Normalize pixel values to [-1, 1] range matching MobileNetV2 preprocessing
+          input[0][y][x][0] = (pixel.r / 127.5) - 1.0;
+          input[0][y][x][1] = (pixel.g / 127.5) - 1.0;
+          input[0][y][x][2] = (pixel.b / 127.5) - 1.0;
+        }
+      }
+
+      // 4. Prepare output buffer
+      var output = List.filled(1 * _labels!.length, 0.0).reshape([1, _labels!.length]);
+
+      // 5. Run prediction
+      _interpreter!.run(input, output);
+
+      // 6. Extract highest probability index
+      List<double> probabilities = List<double>.from(output[0]);
+      int maxIndex = 0;
+      double maxProb = -1.0;
+      for (int i = 0; i < probabilities.length; i++) {
+        if (probabilities[i] > maxProb) {
+          maxProb = probabilities[i];
+          maxIndex = i;
+        }
+      }
+
+      String detectedClass = _labels![maxIndex];
+      String treatment = _treatmentDatabase[detectedClass.toLowerCase()] ?? "No specific treatment details found for this variety. General recommendation: Maintain regular watering schedules and monitor for pests.";
+
+      setState(() {
+        _resultText = "${detectedClass.toUpperCase()} (${(maxProb * 100).toStringAsFixed(1)}%)";
+        _cureText = treatment;
+      });
+
+    } catch (e) {
+      setState(() {
+        _resultText = "Error running diagnostic";
+        _cureText = e.toString();
+      });
+    } finally {
+      setState(() {
+        _isProcessing = false;
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _cameraController?.dispose();
+    _interpreter?.close();
+    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    // This method is rerun every time setState is called, for instance as done
-    // by the _incrementCounter method above.
-    //
-    // The Flutter framework has been optimized to make rerunning build methods
-    // fast, so that you can just rebuild anything that needs updating rather
-    // than having to individually change instances of widgets.
+    if (_cameraController == null || !_cameraController!.value.isInitialized) {
+      return const Scaffold(
+        body: Center(child: CircularProgressIndicator()),
+      );
+    }
+
     return Scaffold(
       appBar: AppBar(
-        // TRY THIS: Try changing the color here to a specific color (to
-        // Colors.amber, perhaps?) and trigger a hot reload to see the AppBar
-        // change color while the other colors stay the same.
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        // Here we take the value from the MyHomePage object that was created by
-        // the App.build method, and use it to set our appbar title.
-        title: Text(widget.title),
+        title: const Text('Crop Disease Detector', style: TextStyle(fontWeight: FontWeight.bold)),
+        backgroundColor: Colors.green.shade700,
+        foregroundColor: Colors.white,
       ),
-      body: Center(
-        // Center is a layout widget. It takes a single child and positions it
-        // in the middle of the parent.
-        child: Column(
-          // Column is also a layout widget. It takes a list of children and
-          // arranges them vertically. By default, it sizes itself to fit its
-          // children horizontally, and tries to be as tall as its parent.
-          //
-          // Column has various properties to control how it sizes itself and
-          // how it positions its children. Here we use mainAxisAlignment to
-          // center the children vertically; the main axis here is the vertical
-          // axis because Columns are vertical (the cross axis would be
-          // horizontal).
-          //
-          // TRY THIS: Invoke "debug painting" (choose the "Toggle Debug Paint"
-          // action in the IDE, or press "p" in the console), to see the
-          // wireframe for each widget.
-          mainAxisAlignment: .center,
-          children: [
-            const Text('You have pushed the button this many times:'),
-            Text(
-              '$_counter',
-              style: Theme.of(context).textTheme.headlineMedium,
+      body: Column(
+        children: [
+          // Camera view panel
+          Expanded(
+            flex: 3,
+            child: ClipRRect(
+              child: CameraPreview(_cameraController!),
             ),
-          ],
-        ),
+          ),
+          
+          // Result Information Panel
+          Expanded(
+            flex: 2,
+            child: Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(20),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
+                boxShadow: [
+                  BoxShadow(color: Colors.black.withOpacity(0.1), blurRadius: 10, offset: const Offset(0, -5))
+                ],
+              ),
+              child: SingleChildScrollView(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text("DIAGNOSIS RESULT", style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.grey)),
+                    const SizedBox(height: 4),
+                    Text(_resultText, style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: Colors.green.shade900)),
+                    const Divider(height: 24),
+                    const Text("RECOMMENDED CURE / TREATMENT", style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.grey)),
+                    const SizedBox(height: 4),
+                    Text(
+                      _cureText.isEmpty ? "Results will update immediately after a successful scan." : _cureText,
+                      style: const TextStyle(fontSize: 15, color: Colors.black87, height: 1.4),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
       ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _incrementCounter,
-        tooltip: 'Increment',
-        child: const Icon(Icons.add),
+      floatingActionButtonLocation: FloatingActionButtonLocation.centerFloat,
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: _isProcessing ? null : _runInference,
+        backgroundColor: Colors.green.shade700,
+        foregroundColor: Colors.white,
+        icon: _isProcessing 
+          ? const SizedBox(width: 24, height: 24, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2.5))
+          : const Icon(Icons.camera_alt),
+        label: Text(_isProcessing ? "Processing..." : "Scan Crop Layer"),
       ),
     );
   }
